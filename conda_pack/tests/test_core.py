@@ -47,6 +47,63 @@ def bad_conda_exe(tmpdir_factory, monkeypatch):
     monkeypatch.delenv('CONDA_EXE', raising=False)
 
 
+def pack_and_unpack(tmpdir, mode, **pack_kwargs):
+    # Unifies the creation of test tarballs and extracted copies
+    out_path = str(tmpdir.join('env.tar'))
+    res = pack(output=out_path, **pack_kwargs)
+    assert res == out_path
+    assert os.path.exists(out_path)
+    assert tarfile.is_tarfile(out_path)
+    if mode == 'unpack':
+        extract_path = str(tmpdir.join('env'))
+        with tarfile.open(out_path) as fil:
+            fil.extractall(extract_path)
+        return extract_path
+    elif mode == 'list':
+        with tarfile.open(out_path) as fil:
+            result = fil.getnames()
+        return out_path, result
+    elif mode == 'pack':
+        return out_path
+    else:
+        raise RuntimeError('Unknown mode: {}'.format(mode))
+
+
+def run_in_unpacked_env(tmpdir, command, post_command=None):
+    # Runs a command in an environment created by pack_and_unpack, by
+    # creating a cmd/bash script which activates the environment, runs
+    # the command, and deactivates, and (optionally) runs a second
+    # command after deactivation. The goal is to closely simulate the
+    # conditions under which a conda-pack environment will be used; in
+    # particular, free of influence from an existing conda installation.
+    path = str(tmpdir.join('env'))
+    if on_win:
+        script_fname = 'unpack.bat'
+        script_part1 = [r"@deactivate", "@doskey conda="]
+        script_part2 = r"@call {path}\Scripts\activate".format(path=path)
+        script_part3 = r"@deactivate"
+        cmd = ['cmd', '/c']
+    else:
+        script_fname = 'unpack.sh'
+        script_part1 = [". deactivate", "unset conda"]
+        script_part2 = ". {path}/bin/activate".format(path=path)
+        script_part3 = ". deactivate"
+        cmd = ['/usr/bin/env', 'bash']
+
+    commands = [script_part2, command, script_part3]
+    if 'CONDA_PREFIX' in os.environ:
+        commands = script_part1 + commands
+    if post_command:
+        commands.append(post_command)
+
+    script_path = tmpdir.join(script_fname)
+    script_path.write('\n'.join(commands))
+    cmd.append(str(script_path))
+
+    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+    return out.decode()
+
+
 def test_name_to_prefix():
     # Smoketest on default name
     name_to_prefix()
@@ -216,19 +273,8 @@ def test_output_and_format(py36_env):
         py36_env._output_and_format(output='foo.bar')
 
 
-def test_roundtrip(tmpdir, py36_env):
-    out_path = os.path.join(str(tmpdir), 'py36.tar')
-    py36_env.pack(out_path)
-    assert os.path.exists(out_path)
-    assert tarfile.is_tarfile(out_path)
-
-    with tarfile.open(out_path) as fil:
-        # Check all files are relative paths
-        for member in fil.getnames():
-            assert not member.startswith(os.path.sep)
-
-        extract_path = str(tmpdir.join('env'))
-        fil.extractall(extract_path)
+def test_roundtrip(tmpdir):
+    extract_path = pack_and_unpack(tmpdir, 'unpack', prefix=py36_path)
 
     # Shebang rewriting happens before prefixes are fixed
     textfile = os.path.join(extract_path, BIN_DIR, 'conda-pack-test-lib1')
@@ -237,64 +283,48 @@ def test_roundtrip(tmpdir, py36_env):
         assert shebang == '#!/usr/bin/env python'
 
     # Check conda-unpack --help and --version
-    if on_win:
-        binary_name = 'conda-unpack.exe'
-        script_name = 'conda-unpack-script.py'
-    else:
-        binary_name = script_name = 'conda-unpack'
-    conda_unpack = os.path.join(extract_path, BIN_DIR, binary_name)
-    conda_unpack_script = os.path.join(extract_path, BIN_DIR, script_name)
-    out = subprocess.check_output([conda_unpack, '--help'],
-                                  stderr=subprocess.STDOUT).decode()
+    out = run_in_unpacked_env(tmpdir, 'conda-unpack --help')
     assert out.startswith('usage: conda-unpack')
 
-    out = subprocess.check_output([conda_unpack, '--version'],
-                                  stderr=subprocess.STDOUT).decode()
+    out = run_in_unpacked_env(tmpdir, 'conda-unpack --version')
     assert out.startswith('conda-unpack')
 
     # Check no prefix generated for python executable
-    python_pattern = re.compile(r'bin/python\d.\d')
+    if on_win:
+        script_name = 'conda-unpack-script.py'
+        python_pattern = re.compile(r'python.?\.exe')
+    else:
+        script_name = 'conda-unpack'
+        python_pattern = re.compile(r'bin/python\d.\d')
+    conda_unpack_script = os.path.join(extract_path, BIN_DIR, script_name)
     conda_unpack_mod = load_source('conda_unpack', conda_unpack_script)
+    assert len(conda_unpack_mod._prefix_records)
     pythons = [r for r in conda_unpack_mod._prefix_records
                if python_pattern.match(r[0])]
     assert not pythons
 
-    if on_win:
-        command = (r"@call {path}\Scripts\activate.bat && "
-                   "conda-unpack.exe && "
-                   r"call {path}\Scripts\deactivate.bat && "
-                   "echo Done").format(path=extract_path)
-        unpack = tmpdir.join('unpack.bat')
-        unpack.write(command)
-        out = subprocess.check_output(['cmd.exe', '/c', str(unpack)],
-                                      stderr=subprocess.STDOUT).decode()
-        assert out == 'Done\r\n'
+    # Check conda-pack completes rewriting without error
+    out = run_in_unpacked_env(tmpdir, 'conda-unpack')
+    assert out.strip().splitlines() == []
 
-    else:
-        # Check bash scripts all don't error
-        command = (". {path}/bin/activate && "
-                   "conda-unpack && "
-                   ". {path}/bin/deactivate && "
-                   "echo 'Done'").format(path=extract_path)
-        out = subprocess.check_output(['/usr/bin/env', 'bash', '-c', command],
-                                      stderr=subprocess.STDOUT).decode()
-        assert out == 'Done\n'
+    # Check the conda-meta directory is non-empty and has been anonymized
+    meta_files = glob(os.path.join(extract_path, 'conda-meta', '*.json'))
+    assert len(meta_files)
+    for path in meta_files:
+        with open(path) as fil:
+            data = json.load(fil)
+        for field in ["extracted_package_dir", "package_tarball_full_path"]:
+            if field in data:
+                assert data[field] == ""
+        if "link" in data and "source" in data["link"]:
+            assert data["link"]["source"] == ""
 
 
 @pytest.mark.parametrize('fix_dest', (True, False))
 def test_pack_with_conda(tmpdir, fix_dest):
-    env = CondaEnv.from_prefix(has_conda_path)
-    out_path = os.path.join(str(tmpdir), 'has_conda.tar')
-    extract_path = os.path.join(str(tmpdir), 'output')
-    env.pack(out_path, dest_prefix=extract_path if fix_dest else None)
-
-    os.mkdir(extract_path)
-
-    assert os.path.exists(out_path)
-    assert tarfile.is_tarfile(out_path)
-    # Extract tarfile
-    with tarfile.open(out_path) as fil:
-        fil.extractall(extract_path)
+    dest_prefix = str(tmpdir.join('env')) if fix_dest else None
+    extract_path = pack_and_unpack(tmpdir, 'unpack', prefix=has_conda_path,
+                                   dest_prefix=dest_prefix)
 
     if on_win:
         fnames = ('conda.exe', 'activate.bat', 'deactivate.bat')
@@ -315,47 +345,16 @@ def test_pack_with_conda(tmpdir, fix_dest):
                 else:
                     assert 'CONDA_PACK' in data
 
-    # Check the packaged conda works and recognizes its environment.
-    # We need to unset CONDA_PREFIX to simulate unpacking into an environment
-    # where conda is not already present.
-    if on_win:
-        commands = (r"@set CONDA_PREFIX=",
-                    r"@call {path}\Scripts\activate".format(path=extract_path),
-                    r"@conda info --json",
-                    r"@deactivate")
-        script_file = tmpdir.join('unpack.bat')
-        cmd = ['cmd', '/c', str(script_file)]
-
-    else:
-        commands = ("unset CONDA_PREFIX",
-                    ". {path}/bin/activate".format(path=extract_path),
-                    "conda info --json",
-                    ". deactivate")
-        script_file = tmpdir.join('unpack.sh')
-        cmd = ['/usr/bin/env', 'bash', str(script_file)]
-
-    script_file.write('\n'.join(commands))
-    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
+    # Check that the packaged conda works and recognizes its environment
+    out = run_in_unpacked_env(tmpdir, 'conda info --json')
     conda_info = json.loads(out)
     extract_path_n = normpath(extract_path)
     for var in ('conda_prefix', 'sys.prefix', 'default_prefix', 'root_prefix'):
         assert normpath(conda_info[var]) == extract_path_n
     assert extract_path_n in list(map(normpath, conda_info['envs']))
 
-    # Check the conda-meta directory has been anonymized
-    for path in glob(os.path.join(extract_path, 'conda-meta', '*.json')):
-        with open(path) as fil:
-            data = json.load(fil)
 
-        for field in ["extracted_package_dir", "package_tarball_full_path"]:
-            if field in data:
-                assert data[field] == ""
-
-        if "link" in data and "source" in data["link"]:
-            assert data["link"]["source"] == ""
-
-
-def test_pack_exceptions(py36_env):
+def test_pack_exceptions():
     # Can't pass both prefix and name
     with pytest.raises(CondaPackException):
         pack(prefix=py36_path, name='py36')
@@ -391,38 +390,27 @@ def test_zip64(tmpdir):
     assert os.path.exists(out_path)
 
 
-def test_force(tmpdir, py36_env):
-    already_exists = os.path.join(str(tmpdir), 'py36.tar')
+def test_force(tmpdir):
+    already_exists = os.path.join(str(tmpdir), 'env.tar')
     with open(already_exists, 'wb'):
         pass
 
     # file already exists
     with pytest.raises(CondaPackException):
-        py36_env.pack(output=already_exists)
+        pack_and_unpack(tmpdir, 'pack', prefix=py36_path)
 
-    py36_env.pack(output=already_exists, force=True)
-    assert tarfile.is_tarfile(already_exists)
+    out_file = pack_and_unpack(tmpdir, 'pack', prefix=py36_path, force=True)
+    assert out_file == already_exists
 
 
 def test_pack(tmpdir, py36_env):
-    out_path = os.path.join(str(tmpdir), 'py36.tar')
-
     exclude1 = "*.py"
     exclude2 = "*.pyc"
     include = os.path.join(SP_36, 'conda_pack_test_lib1', '*')
-
-    res = pack(prefix=py36_path,
-               output=out_path,
-               filters=[("exclude", exclude1),
-                        ("exclude", exclude2),
-                        ("include", include)])
-
-    assert res == out_path
-    assert os.path.exists(out_path)
-    assert tarfile.is_tarfile(out_path)
-
-    with tarfile.open(out_path) as fil:
-        paths = fil.getnames()
+    out_path, paths = pack_and_unpack(tmpdir, 'list', prefix=py36_path,
+                                      filters=[("exclude", exclude1),
+                                               ("exclude", exclude2),
+                                               ("include", include)])
 
     filtered = (py36_env
                 .exclude(exclude1)
@@ -442,38 +430,31 @@ def test_pack(tmpdir, py36_env):
     assert diff == set(os.path.join(BIN_DIR_L, f) for f in fnames)
 
 
-def test_dest_prefix(tmpdir, py36_env):
-    out_path = os.path.join(str(tmpdir), 'py36.tar')
-    dest = r'C:\foo\bar\baz\biz' if on_win else '/foo/bar/baz/biz'
-    res = pack(prefix=py36_path,
-               dest_prefix=dest,
-               output=out_path)
-
-    assert res == out_path
-    assert os.path.exists(out_path)
-    assert tarfile.is_tarfile(out_path)
-
-    with tarfile.open(out_path) as fil:
-        paths = fil.getnames()
-
-    # No conda-unpack generated
-    assert 'conda-unpack' not in paths
+def test_dest_prefix(tmpdir):
+    dest_prefix = r'C:\foo\bar\baz\biz' if on_win else '/foo/bar/baz/biz'
+    out_path = pack_and_unpack(tmpdir, 'pack', prefix=py36_path,
+                               dest_prefix=dest_prefix)
 
     if on_win:
+        pack_script = 'Scripts/conda-unpack-script.py'
         test_files = ['Scripts/conda-pack-test-lib1',
                       'Scripts/pytest.exe']
     else:
+        pack_script = 'bin/conda-pack'
         test_files = ['bin/conda-pack-test-lib1',
                       'bin/pytest',
                       'bin/clear']
 
-    orig_bytes = py36_env.prefix.encode()
-    new_bytes = dest.encode()
+    orig_bytes = py36_path.encode()
+    new_bytes = dest_prefix.encode()
 
-    # all paths, including shebangs, are rewritten using the prefix
     with tarfile.open(out_path) as fil:
+        # No conda-unpack generated
+        with pytest.raises(KeyError):
+            fil.getmember(pack_script)
+        # all paths, including shebangs, are rewritten using the prefix
         for test_file in test_files:
-            orig_path = os.path.join(py36_env.prefix, test_file)
+            orig_path = os.path.join(py36_path, test_file)
             with open(orig_path, 'rb') as fil2:
                 orig_data = fil2.read()
             if orig_bytes in orig_data:
@@ -483,38 +464,12 @@ def test_dest_prefix(tmpdir, py36_env):
 
 
 def test_activate(tmpdir):
-    out_path = os.path.join(str(tmpdir), 'activate_scripts.tar')
-    extract_path = str(tmpdir.join('env'))
+    pack_and_unpack(tmpdir, 'unpack', prefix=activate_scripts_path)
 
-    env = CondaEnv.from_prefix(activate_scripts_path)
-    env.pack(out_path)
-
-    with tarfile.open(out_path) as fil:
-        fil.extractall(extract_path)
-
-    # Check that activate environment variable is set
+    # Check that activate environment variable is set and unset
     if on_win:
-        command = (r"@CALL {path}\Scripts\activate" "\r\n"
-                   r"@ECHO CONDAPACK_ACTIVATED=%CONDAPACK_ACTIVATED%" "\r\n"
-                   r"@CALL {path}\Scripts\deactivate" "\r\n"
-                   r"@ECHO CONDAPACK_ACTIVATED=%CONDAPACK_ACTIVATED%" "\r\n"
-                   r"@echo Done").format(path=extract_path)
-        unpack = tmpdir.join('unpack.bat')
-        unpack.write(command)
-
-        out = subprocess.check_output(['cmd', '/c', str(unpack)],
-                                      stderr=subprocess.STDOUT).decode()
-
-        assert out == 'CONDAPACK_ACTIVATED=1\r\nCONDAPACK_ACTIVATED=\r\nDone\r\n'
-
+        command = 'echo CONDAPACK_ACTIVATED=%CONDAPACK_ACTIVATED%'
     else:
-        command = (". {path}/bin/activate && "
-                   "test $CONDAPACK_ACTIVATED -eq 1 && "
-                   ". {path}/bin/deactivate && "
-                   "test ! $CONDAPACK_ACTIVATED && "
-                   "echo 'Done'").format(path=extract_path)
-
-        out = subprocess.check_output(['/usr/bin/env', 'bash', '-c', command],
-                                      stderr=subprocess.STDOUT).decode()
-
-        assert out == 'Done\n'
+        command = 'echo CONDAPACK_ACTIVATED=$CONDAPACK_ACTIVATED'
+    out = run_in_unpacked_env(tmpdir, command, command)
+    assert out.strip().splitlines() == ['CONDAPACK_ACTIVATED=1', 'CONDAPACK_ACTIVATED=']
